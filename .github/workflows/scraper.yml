@@ -1,0 +1,46 @@
+name: Salon Apprentice Scraper
+
+on:
+  schedule:
+    # 9am–9pm ET (EDT = UTC-4): 13:00–01:00 UTC
+    # Morning summary: 9am ET = 13:00 UTC
+    # Hourly updates: 10am–9pm ET = 14:00–01:00 UTC
+    - cron: '0 13-23 * * *'  # 9am–7pm ET
+    - cron: '0 0-1 * * *'    # 8pm–9pm ET
+  workflow_dispatch:          # allow manual runs for testing
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write         # needed to commit state.json back
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+        run: python scraper.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || git commit -m "chore: update scraper state [skip ci]"
+          git push
