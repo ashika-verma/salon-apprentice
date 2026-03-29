@@ -10,7 +10,7 @@ Same subject each day so Gmail threads everything together.
 import json
 import os
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import requests
@@ -49,21 +49,8 @@ def save_state(state: dict):
 
 # ── Date helpers ───────────────────────────────────────────────────────────
 
-def get_week_range():
-    today = date.today()
-    start = today - timedelta(days=today.weekday())
-    end = start + timedelta(days=6)
-    return start, end
-
-
 def is_target_date(service_date: date) -> bool:
-    today = date.today()
-    week_start, week_end = get_week_range()
-    if week_start <= service_date <= week_end:
-        return True
-    if service_date >= today and service_date.weekday() in (5, 6):
-        return True
-    return False
+    return service_date >= date.today()
 
 
 def parse_date(text: str) -> date | None:
@@ -172,7 +159,6 @@ def table_html(rows: str) -> str:
 
 def build_morning_html(listings: list[dict]) -> str:
     today = date.today()
-    week_start, week_end = get_week_range()
     if listings:
         body = table_html(listing_rows_html(listings))
     else:
@@ -183,8 +169,7 @@ def build_morning_html(listings: list[dict]) -> str:
       <h2 style="color:#7c4dff;margin-bottom:4px;">Good morning ☀️ — your salon picks</h2>
       <p style="color:#888;font-size:13px;margin-top:0;">
         {today.strftime('%A, %B %-d %Y')} &nbsp;·&nbsp;
-        Balayage &amp; nails available this week
-        ({week_start.strftime('%-m/%-d')}–{week_end.strftime('%-m/%-d')}) or on future weekends
+        Balayage &amp; nails available from today onwards
       </p>
       {body}
       <p style="margin-top:24px;font-size:12px;color:#bbb;">
