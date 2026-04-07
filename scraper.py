@@ -10,7 +10,8 @@ Same subject each day so Gmail threads everything together.
 import json
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, time
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import requests
@@ -29,6 +30,19 @@ BASE_URL = "https://www.salonapprentice.com/free-salon-services/"
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
 
 KEYWORDS = ["balayage", "nail", "nails", "manicure", "pedicure"]
+HAIRCUT_KEYWORDS = ["haircut", "hair cut"]
+
+MANHATTAN_NEIGHBORHOODS = {
+    "manhattan", "upper east side", "upper west side", "midtown", "downtown",
+    "chelsea", "tribeca", "soho", "noho", "nolita", "lower east side",
+    "east village", "west village", "greenwich village", "hell's kitchen",
+    "harlem", "washington heights", "inwood", "murray hill", "gramercy",
+    "flatiron", "financial district", "battery park", "kips bay",
+    "sutton place", "yorkville", "morningside heights", "hamilton heights",
+    "midtown east", "midtown west", "times square", "theater district",
+    "carnegie hill", "lenox hill", "hudson yards", "nomad", "two bridges",
+    "chinatown", "little italy", "bowery", "alphabet city", "ues", "uws",
+}
 
 ET = ZoneInfo("America/New_York")
 
@@ -53,18 +67,119 @@ def is_target_date(service_date: date) -> bool:
     return service_date >= date.today()
 
 
-def parse_date(text: str) -> date | None:
+def parse_date(text: str) -> Optional[date]:
     m = re.match(r"(\d{1,2})/(\d{1,2})/(\d{4})", text.strip())
     if m:
         return date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
     return None
 
 
+# ── Availability filter ────────────────────────────────────────────────────
+
+TIME_PATTERNS = [
+    # "2:30 PM", "2:30PM", "2:30 pm"
+    r"\b(\d{1,2}):(\d{2})\s*(am|pm)\b",
+    # "2 PM", "2pm"
+    r"\b(\d{1,2})\s*(am|pm)\b",
+    # 24h: "14:30"
+    r"\b([01]?\d|2[0-3]):([0-5]\d)\b",
+]
+
+
+def parse_time_from_text(text: str) -> Optional[time]:
+    """Extract the earliest time mention from a block of text."""
+    text_lower = text.lower()
+    for pattern in TIME_PATTERNS[:2]:  # 12h formats first
+        for m in re.finditer(pattern, text_lower):
+            groups = m.groups()
+            hour = int(groups[0])
+            minute = int(groups[1]) if len(groups) == 3 else 0
+            meridiem = groups[-1]
+            if meridiem == "pm" and hour != 12:
+                hour += 12
+            elif meridiem == "am" and hour == 12:
+                hour = 0
+            if 0 <= hour <= 23:
+                return time(hour, minute)
+    # Try 24h
+    for m in re.finditer(TIME_PATTERNS[2], text_lower):
+        hour, minute = int(m.group(1)), int(m.group(2))
+        if 0 <= hour <= 23:
+            return time(hour, minute)
+    return None
+
+
+def fetch_listing_time(link: str, session: requests.Session) -> Optional[time]:
+    """Fetch a listing detail page and extract the service time."""
+    if not link:
+        return None
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; salon-apprentice-bot/1.0)"}
+        resp = session.get(link, headers=headers, timeout=15)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # Try description / notes fields first, then full page text
+        for selector in [
+            {"data-field": "notes"},
+            {"data-field": "description"},
+            {"data-field": "service_time"},
+            {"class": "listing-description"},
+            {"class": "listing-notes"},
+        ]:
+            tag = soup.find(attrs=selector)
+            if tag:
+                t = parse_time_from_text(tag.get_text(" ", strip=True))
+                if t:
+                    return t
+        # Fallback: scan all visible text
+        return parse_time_from_text(soup.get_text(" ", strip=True))
+    except Exception:
+        return None
+
+
+def is_manhattan(neighborhood: str, salon: str) -> bool:
+    text = (neighborhood + " " + salon).lower()
+    return any(nb in text for nb in MANHATTAN_NEIGHBORHOODS)
+
+
+def is_womens_medium_haircut(combined: str) -> bool:
+    """Return False only if the listing explicitly targets men or a non-medium length."""
+    male_terms = ["men's", "mens ", "for men", "male only", "boy's haircut", "boys haircut"]
+    female_terms = ["women", "woman", "female", "ladies", "lady", "girl"]
+    if any(t in combined for t in male_terms) and not any(t in combined for t in female_terms):
+        return False
+    # Exclude explicitly short or long if length is mentioned but not medium
+    non_medium = ["short haircut", "short hair cut", "short cut", "long haircut", "long hair cut"]
+    medium = ["medium", "med length", "mid length"]
+    if any(t in combined for t in non_medium) and not any(t in combined for t in medium):
+        return False
+    return True
+
+
+def is_available_slot(service_date: Optional[date], service_time: Optional[time]) -> bool:
+    """Return True if the slot fits the user's schedule.
+
+    Rules:
+    - Weekends (Sat/Sun): always available.
+    - Weekdays (Mon–Fri): only available at 5pm or later.
+    - If we couldn't parse a time on a weekday, include it (don't miss opportunities).
+    """
+    if service_date is None:
+        return True
+    weekday = service_date.weekday()  # 0=Mon … 6=Sun
+    if weekday >= 5:  # weekend
+        return True
+    if service_time is None:
+        return True  # unknown time — include to avoid missing it
+    return service_time >= time(17, 0)
+
+
 # ── Scraping ───────────────────────────────────────────────────────────────
 
-def scrape_listings() -> list[dict]:
+def scrape_listings() -> list:
     headers = {"User-Agent": "Mozilla/5.0 (compatible; salon-apprentice-bot/1.0)"}
-    resp = requests.get(LISTINGS_URL, headers=headers, timeout=30)
+    session = requests.Session()
+    resp = session.get(LISTINGS_URL, headers=headers, timeout=30)
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -94,11 +209,31 @@ def scrape_listings() -> list[dict]:
         service_date_raw = cell("service_date")
 
         combined = (title + " " + service_type).lower()
-        if not any(kw in combined for kw in KEYWORDS):
+        is_free = fee.lower() != "yes"
+
+        # Determine which category this listing qualifies under
+        is_balayage_nails = any(kw in combined for kw in KEYWORDS)
+        # Balayage must be free
+        if is_balayage_nails and "balayage" in combined and not is_free:
+            is_balayage_nails = False
+
+        is_haircut = (
+            any(kw in combined for kw in HAIRCUT_KEYWORDS)
+            and is_free
+            and is_manhattan(neighborhood, salon)
+            and is_womens_medium_haircut(combined)
+        )
+
+        if not is_balayage_nails and not is_haircut:
             continue
 
         service_date = parse_date(service_date_raw)
         if service_date and not is_target_date(service_date):
+            continue
+
+        # Fetch detail page to find service time, then apply availability filter
+        listing_time = fetch_listing_time(link, session)
+        if not is_available_slot(service_date, listing_time):
             continue
 
         listing_id = link.split("editid1=")[-1] if "editid1=" in link else record_id
@@ -112,6 +247,7 @@ def scrape_listings() -> list[dict]:
             "salon": salon,
             "neighborhood": neighborhood,
             "service_date": service_date_raw,
+            "service_time": listing_time.strftime("%-I:%M %p") if listing_time else "",
         })
 
     return results
@@ -119,7 +255,7 @@ def scrape_listings() -> list[dict]:
 
 # ── Email ──────────────────────────────────────────────────────────────────
 
-def listing_rows_html(listings: list[dict]) -> str:
+def listing_rows_html(listings: list) -> str:
     rows = ""
     for l in listings:
         fee_badge = (
@@ -134,7 +270,7 @@ def listing_rows_html(listings: list[dict]) -> str:
             <div style="color:#888;font-size:13px;margin-top:3px;">{l['service_type']} &nbsp;{fee_badge}</div>
           </td>
           <td style="padding:12px 8px;color:#555;">{l['neighborhood'] or l['salon'] or '—'}</td>
-          <td style="padding:12px 8px;color:#555;white-space:nowrap;">{l['service_date']}</td>
+          <td style="padding:12px 8px;color:#555;white-space:nowrap;">{l['service_date']}{(' @ ' + l['service_time']) if l.get('service_time') else ''}</td>
           <td style="padding:12px 8px;">
             <a href="{l['link']}" style="display:inline-block;padding:5px 12px;background:#7c4dff;color:#fff;border-radius:4px;font-size:12px;text-decoration:none;white-space:nowrap;">View →</a>
           </td>
@@ -157,7 +293,7 @@ def table_html(rows: str) -> str:
     </table>"""
 
 
-def build_morning_html(listings: list[dict]) -> str:
+def build_morning_html(listings: list) -> str:
     today = date.today()
     if listings:
         body = table_html(listing_rows_html(listings))
@@ -179,7 +315,7 @@ def build_morning_html(listings: list[dict]) -> str:
     </div>"""
 
 
-def build_update_html(new_listings: list[dict], now: datetime) -> str:
+def build_update_html(new_listings: list, now: datetime) -> str:
     time_str = now.strftime("%-I:%M %p")
     rows = listing_rows_html(new_listings)
     return f"""
