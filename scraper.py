@@ -10,6 +10,7 @@ Same subject each day so Gmail threads everything together.
 import json
 import os
 import re
+import time as time_module
 from datetime import date, datetime, time
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -29,20 +30,7 @@ LISTINGS_URL = (
 BASE_URL = "https://www.salonapprentice.com/free-salon-services/"
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
 
-KEYWORDS = ["balayage", "nail", "nails", "manicure", "pedicure"]
-HAIRCUT_KEYWORDS = ["haircut", "hair cut"]
-
-MANHATTAN_NEIGHBORHOODS = {
-    "manhattan", "upper east side", "upper west side", "midtown", "downtown",
-    "chelsea", "tribeca", "soho", "noho", "nolita", "lower east side",
-    "east village", "west village", "greenwich village", "hell's kitchen",
-    "harlem", "washington heights", "inwood", "murray hill", "gramercy",
-    "flatiron", "financial district", "battery park", "kips bay",
-    "sutton place", "yorkville", "morningside heights", "hamilton heights",
-    "midtown east", "midtown west", "times square", "theater district",
-    "carnegie hill", "lenox hill", "hudson yards", "nomad", "two bridges",
-    "chinatown", "little italy", "bowery", "alphabet city", "ues", "uws",
-}
+BALAYAGE_KEYWORDS = ["balayage"]
 
 ET = ZoneInfo("America/New_York")
 
@@ -74,51 +62,18 @@ def parse_date(text: str) -> Optional[date]:
     return None
 
 
-# ── Availability filter ────────────────────────────────────────────────────
+# ── Gemini analysis ────────────────────────────────────────────────────────
 
-TIME_PATTERNS = [
-    # "2:30 PM", "2:30PM", "2:30 pm"
-    r"\b(\d{1,2}):(\d{2})\s*(am|pm)\b",
-    # "2 PM", "2pm"
-    r"\b(\d{1,2})\s*(am|pm)\b",
-    # 24h: "14:30"
-    r"\b([01]?\d|2[0-3]):([0-5]\d)\b",
-]
-
-
-def parse_time_from_text(text: str) -> Optional[time]:
-    """Extract the earliest time mention from a block of text."""
-    text_lower = text.lower()
-    for pattern in TIME_PATTERNS[:2]:  # 12h formats first
-        for m in re.finditer(pattern, text_lower):
-            groups = m.groups()
-            hour = int(groups[0])
-            minute = int(groups[1]) if len(groups) == 3 else 0
-            meridiem = groups[-1]
-            if meridiem == "pm" and hour != 12:
-                hour += 12
-            elif meridiem == "am" and hour == 12:
-                hour = 0
-            if 0 <= hour <= 23:
-                return time(hour, minute)
-    # Try 24h
-    for m in re.finditer(TIME_PATTERNS[2], text_lower):
-        hour, minute = int(m.group(1)), int(m.group(2))
-        if 0 <= hour <= 23:
-            return time(hour, minute)
-    return None
-
-
-def fetch_listing_time(link: str, session: requests.Session) -> Optional[time]:
-    """Fetch a listing detail page and extract the service time."""
+def fetch_listing_page_text(link: str, session: requests.Session) -> str:
+    """Fetch a listing detail page and return its visible text."""
     if not link:
-        return None
+        return ""
     try:
         headers = {"User-Agent": "Mozilla/5.0 (compatible; salon-apprentice-bot/1.0)"}
         resp = session.get(link, headers=headers, timeout=15)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
-        # Try description / notes fields first, then full page text
+        parts = []
         for selector in [
             {"data-field": "notes"},
             {"data-field": "description"},
@@ -128,32 +83,62 @@ def fetch_listing_time(link: str, session: requests.Session) -> Optional[time]:
         ]:
             tag = soup.find(attrs=selector)
             if tag:
-                t = parse_time_from_text(tag.get_text(" ", strip=True))
-                if t:
-                    return t
-        # Fallback: scan all visible text
-        return parse_time_from_text(soup.get_text(" ", strip=True))
+                parts.append(tag.get_text(" ", strip=True))
+        return " ".join(parts) if parts else soup.get_text(" ", strip=True)[:2000]
     except Exception:
-        return None
+        return ""
 
 
-def is_manhattan(neighborhood: str, salon: str) -> bool:
-    text = (neighborhood + " " + salon).lower()
-    return any(nb in text for nb in MANHATTAN_NEIGHBORHOODS)
+def analyze_with_gemini(text: str) -> dict:
+    """Use Gemini to extract appointment time and check suitability.
+    Returns {"time": "HH:MM" (24h) or None, "suitable": bool}.
+    On failure, returns {"time": None, "suitable": True} to avoid dropping listings.
+    """
+    from google import genai as google_genai
 
+    prompt = f"""You are filtering salon apprenticeship listings for a specific person.
 
-def is_womens_medium_haircut(combined: str) -> bool:
-    """Return False only if the listing explicitly targets men or a non-medium length."""
-    male_terms = ["men's", "mens ", "for men", "male only", "boy's haircut", "boys haircut"]
-    female_terms = ["women", "woman", "female", "ladies", "lady", "girl"]
-    if any(t in combined for t in male_terms) and not any(t in combined for t in female_terms):
-        return False
-    # Exclude explicitly short or long if length is mentioned but not medium
-    non_medium = ["short haircut", "short hair cut", "short cut", "long haircut", "long hair cut"]
-    medium = ["medium", "med length", "mid length"]
-    if any(t in combined for t in non_medium) and not any(t in combined for t in medium):
-        return False
-    return True
+Person's profile:
+- She is looking for FREE balayage services only.
+- She works Mon–Fri until 5pm, so she needs appointments at 5pm or later on weekdays, or any time on weekends.
+
+Listing description:
+---
+{text[:1500]}
+---
+
+Return ONLY a valid JSON object, no markdown, no explanation:
+{{
+  "time": "<HH:MM in 24-hour format, or null if no time is mentioned>",
+  "suitable": <true or false>
+}}
+
+Rules for "suitable":
+- Always true (time filtering is handled separately)."""
+
+    try:
+        client = google_genai.Client(
+            api_key=os.environ["GOOGLE_API_KEY"],
+            http_options={"api_version": "v1"},
+        )
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(model="gemini-2.0-flash-lite", contents=prompt)
+                break
+            except Exception as retry_err:
+                if attempt == 2:
+                    raise
+                wait = 5 * (attempt + 1)
+                print(f"Gemini rate limit, retrying in {wait}s…")
+                time_module.sleep(wait)
+        raw = response.text.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"```[a-z]*\n?", "", raw).strip().rstrip("`").strip()
+        result = json.loads(raw)
+        return {"time": result.get("time"), "suitable": bool(result.get("suitable", True))}
+    except Exception as e:
+        print(f"Gemini analysis failed for listing: {e}")
+        return {"time": None, "suitable": True}
 
 
 def is_available_slot(service_date: Optional[date], service_time: Optional[time]) -> bool:
@@ -211,28 +196,30 @@ def scrape_listings() -> list:
         combined = (title + " " + service_type).lower()
         is_free = fee.lower() != "yes"
 
-        # Determine which category this listing qualifies under
-        is_balayage_nails = any(kw in combined for kw in KEYWORDS)
-        # Balayage must be free
-        if is_balayage_nails and "balayage" in combined and not is_free:
-            is_balayage_nails = False
+        is_balayage = any(kw in combined for kw in BALAYAGE_KEYWORDS) and is_free
 
-        is_haircut = (
-            any(kw in combined for kw in HAIRCUT_KEYWORDS)
-            and is_free
-            and is_manhattan(neighborhood, salon)
-            and is_womens_medium_haircut(combined)
-        )
-
-        if not is_balayage_nails and not is_haircut:
+        if not is_balayage:
             continue
 
         service_date = parse_date(service_date_raw)
         if service_date and not is_target_date(service_date):
             continue
 
-        # Fetch detail page to find service time, then apply availability filter
-        listing_time = fetch_listing_time(link, session)
+        # Use Gemini to extract time and check suitability from the listing page
+        page_text = fetch_listing_page_text(link, session)
+        analysis = analyze_with_gemini(page_text)
+
+        if not analysis["suitable"]:
+            continue
+
+        listing_time = None
+        if analysis["time"]:
+            try:
+                h, m = map(int, analysis["time"].split(":"))
+                listing_time = time(h, m)
+            except Exception:
+                pass
+
         if not is_available_slot(service_date, listing_time):
             continue
 
@@ -302,10 +289,10 @@ def build_morning_html(listings: list) -> str:
 
     return f"""
     <div style="font-family:sans-serif;max-width:640px;margin:auto;padding:24px;">
-      <h2 style="color:#7c4dff;margin-bottom:4px;">Good morning ☀️ — your salon picks</h2>
+      <h2 style="color:#7c4dff;margin-bottom:4px;">Good morning ☀️ — your free balayage picks</h2>
       <p style="color:#888;font-size:13px;margin-top:0;">
         {today.strftime('%A, %B %-d %Y')} &nbsp;·&nbsp;
-        Balayage &amp; nails available from today onwards
+        Free balayage listings from today onwards
       </p>
       {body}
       <p style="margin-top:24px;font-size:12px;color:#bbb;">
